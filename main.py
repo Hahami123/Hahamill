@@ -1,5 +1,5 @@
 import telebot
-from telebot import types
+from telebot import types,TeleBot
 import random
 
 TOKEN = "7947093127:AAFNgyYA3Y0VOAq1NjqG-vlShbnxl-jEXdQ"
@@ -146,6 +146,7 @@ recipes_db = {
 }
 
 favorites_db = {}
+user_sessions = {}
 
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -159,20 +160,93 @@ def main_menu():
     markup.add(*[types.KeyboardButton(btn) for btn in buttons])
     return markup
 
-def get_unique_ingredients():
-    ingredients = set()
-    for category in recipes_db.values():
-        for recipe in category:
-            for ingredient in recipe['ingredients'].split(','):
-                cleaned = ingredient.strip().lower()
-                if cleaned: ingredients.add(cleaned)
-    return sorted(ingredients)
+def create_session(user_id, recipes):
+    user_sessions[user_id] = {
+        'current_index': 0,
+        'recipes': recipes,
+        'message_id': None
+    }
 
-def add_fav_button(recipe):
-    markup = types.InlineKeyboardMarkup()
-    btn = types.InlineKeyboardButton("❤️ Добавить в избранное", callback_data=f"add_fav_{recipe['name']}")
-    markup.add(btn)
+def get_navigation_buttons(current_index, total):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    if current_index > 0:
+        buttons.append(types.InlineKeyboardButton("⬅️ Предыдущий", callback_data="prev_recipe"))
+    if current_index < total - 1:
+        buttons.append(types.InlineKeyboardButton("➡️ Следующий", callback_data="next_recipe"))
+    markup.add(*buttons)
     return markup
+
+def send_recipe(chat_id):
+    session = user_sessions.get(chat_id)
+    if not session or not session['recipes']:
+        return
+    
+    recipe = session['recipes'][session['current_index']]
+    text = f"🍲 {recipe['name']}\n\nИнгредиенты:\n{recipe['ingredients']}\n\nИнструкция:\n{recipe['instructions']}"
+    
+    markup = get_navigation_buttons(session['current_index'], len(session['recipes']))
+    
+    # Добавляем разные кнопки в зависимости от контекста
+    if session.get('context') == 'favorites':
+        del_btn = types.InlineKeyboardButton("🗑 Удалить из избранного", callback_data=f"del_fav_{recipe['name']}")
+        markup.add(del_btn)
+    else:
+        fav_btn = types.InlineKeyboardButton("❤️ В избранное", callback_data=f"add_fav_{recipe['name']}")
+        markup.add(fav_btn)
+    
+    if session['message_id']:
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=session['message_id'],
+                text=text,
+                reply_markup=markup
+            )
+        except Exception as e:
+            print(f"Ошибка при редактировании сообщения: {e}")
+            msg = bot.send_message(chat_id, text, reply_markup=markup)
+            session['message_id'] = msg.message_id
+    else:
+        msg = bot.send_message(chat_id, text, reply_markup=markup)
+        session['message_id'] = msg.message_id
+
+def show_favorites(message):
+    user_id = message.chat.id
+    if user_id not in favorites_db or not favorites_db[user_id]:
+        bot.send_message(user_id, "В избранном пока ничего нет 😞")
+        return
+
+    create_session(user_id, favorites_db[user_id])
+    user_sessions[user_id]['context'] = 'favorites'  # Добавляем контекст
+    send_recipe(user_id)  # Убедитесь, что этот вызов идет после установки контекста
+
+def remove_from_favorites(call):
+    user_id = call.message.chat.id
+    recipe_name = call.data[8:]
+    
+    if user_id in favorites_db:
+        # Удаляем рецепт из избранного
+        favorites_db[user_id] = [r for r in favorites_db[user_id] if r['name'] != recipe_name]
+        
+        # Обновляем текущую сессию если она есть
+        session = user_sessions.get(user_id)
+        if session and session.get('context') == 'favorites':
+            # Обновляем список рецептов в сессии
+            session['recipes'] = favorites_db[user_id]
+            
+            # Корректируем текущий индекс
+            if session['current_index'] >= len(session['recipes']):
+                session['current_index'] = max(0, len(session['recipes']) - 1)
+            
+            if len(session['recipes']) > 0:
+                send_recipe(user_id)
+            else:
+                bot.delete_message(user_id, session['message_id'])
+                bot.send_message(user_id, "Избранное теперь пусто")
+                del user_sessions[user_id]
+        
+        bot.answer_callback_query(call.id, "❌ Удалено из избранного")
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -183,53 +257,78 @@ def send_welcome(message):
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     if message.text == "🍴 Случайный рецепт":
-        send_random_recipe(message)
+        all_recipes = [recipe for category in recipes_db.values() for recipe in category]
+        random.shuffle(all_recipes)
+        create_session(message.chat.id, all_recipes)
+        send_recipe(message.chat.id)
+    
     elif message.text == "📂 Поиск по категориям":
         show_categories(message)
+    
     elif message.text == "🔍 Поиск по ингредиентам":
         bot.send_message(message.chat.id, "Введите ингредиенты через запятую:")
+    
     elif message.text == "📜 Доступные ингредиенты":
         show_available_ingredients(message)
+    
     elif message.text == "❤️ Избранное":
         show_favorites(message)
+    
     else:
         search_by_ingredients(message)
-
-def show_available_ingredients(message):
-    ingredients = get_unique_ingredients()
-    text = "🍴 Доступные ингредиенты:\n\n• " + "\n• ".join(ingredients) if ingredients else "Ингредиенты пока не добавлены 😞"
-    bot.send_message(message.chat.id, text)
 
 def show_categories(message):
     markup = types.InlineKeyboardMarkup()
     for category in recipes_db.keys():
-        markup.add(types.InlineKeyboardButton(category, callback_data=category))
+        markup.add(types.InlineKeyboardButton(category, callback_data=f"cat_{category}"))
     bot.send_message(message.chat.id, "Выберите категорию:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_inline(call):
+    user_id = call.message.chat.id
+    session = user_sessions.get(user_id)
+    
+    # Обработка навигации
+    if call.data == "prev_recipe":
+        if session and session['current_index'] > 0:
+            session['current_index'] -= 1
+            send_recipe(user_id)
+        return
+    
+    if call.data == "next_recipe":
+        if session and session['current_index'] < len(session['recipes']) - 1:
+            session['current_index'] += 1
+            send_recipe(user_id)
+        return
+    
+    # Обработка избранного
     if call.data.startswith('add_fav_'):
         recipe_name = call.data[8:]
         add_to_favorites(call)
-    elif call.data.startswith('del_fav_'):
+        return
+    
+    if call.data.startswith('del_fav_'):
         recipe_name = call.data[8:]
         remove_from_favorites(call)
-    elif call.data in recipes_db:
-        send_category_recipes(call.message, call.data)
+        return
+    
+    # Обработка выбора категории
+    if call.data.startswith('cat_'):
+        category = call.data[4:]
+        if category in recipes_db:
+            create_session(user_id, recipes_db[category])
+            send_recipe(user_id)
+        return
 
-def send_category_recipes(message, category):
-    for recipe in recipes_db[category]:
-        text = f"🍲 {recipe['name']}\n\nИнгредиенты:\n{recipe['ingredients']}\n\nИнструкция:\n{recipe['instructions']}"
-        bot.send_message(message.chat.id, text, reply_markup=add_fav_button(recipe))
-
-def send_random_recipe(message):
-    all_recipes = [recipe for category in recipes_db.values() for recipe in category]
-    if all_recipes:
-        recipe = random.choice(all_recipes)
-        text = f"🎲 Случайный рецепт: {recipe['name']}\n\nИнгредиенты:\n{recipe['ingredients']}\n\nИнструкция:\n{recipe['instructions']}"
-        bot.send_message(message.chat.id, text, reply_markup=add_fav_button(recipe))
-    else:
-        bot.send_message(message.chat.id, "Рецептов пока нет 😞")
+def show_available_ingredients(message):
+    ingredients = set()
+    for category in recipes_db.values():
+        for recipe in category:
+            for ingredient in recipe['ingredients'].split(','):
+                cleaned = ingredient.strip().lower()
+                if cleaned: ingredients.add(cleaned)
+    text = "🍴 Доступные ингредиенты:\n\n• " + "\n• ".join(sorted(ingredients)) if ingredients else "Ингредиенты пока не добавлены 😞"
+    bot.send_message(message.chat.id, text)
 
 def search_by_ingredients(message):
     ingredients = [i.strip().lower() for i in message.text.split(',')]
@@ -242,9 +341,8 @@ def search_by_ingredients(message):
                 found_recipes.append(recipe)
     
     if found_recipes:
-        for recipe in found_recipes:
-            text = f"🔍 Найден рецепт: {recipe['name']}\n\nИнгредиенты:\n{recipe['ingredients']}\n\nИнструкция:\n{recipe['instructions']}"
-            bot.send_message(message.chat.id, text, reply_markup=add_fav_button(recipe))
+        create_session(message.chat.id, found_recipes)
+        send_recipe(message.chat.id)
     else:
         bot.send_message(message.chat.id, "По вашему запросу ничего не найдено 😞")
 
@@ -254,13 +352,8 @@ def show_favorites(message):
         bot.send_message(user_id, "В избранном пока ничего нет 😞")
         return
     
-    bot.send_message(user_id, "❤️ Ваше избранное:")
-    for recipe in favorites_db[user_id]:
-        text = f"🍲 {recipe['name']}\n\nИнгредиенты:\n{recipe['ingredients']}\n\nИнструкция:\n{recipe['instructions']}"
-        markup = types.InlineKeyboardMarkup()
-        btn = types.InlineKeyboardButton("🗑 Удалить", callback_data=f"del_fav_{recipe['name']}")
-        markup.add(btn)
-        bot.send_message(user_id, text, reply_markup=markup)
+    create_session(user_id, favorites_db[user_id])
+    send_recipe(user_id)
 
 def add_to_favorites(call):
     user_id = call.message.chat.id
@@ -287,6 +380,8 @@ def remove_from_favorites(call):
     if user_id in favorites_db:
         favorites_db[user_id] = [r for r in favorites_db[user_id] if r['name'] != recipe_name]
         bot.answer_callback_query(call.id, "❌ Удалено из избранного")
+        if not favorites_db[user_id]:
+            bot.send_message(user_id, "Избранное теперь пусто")
 
 def find_recipe_by_name(name):
     for category in recipes_db.values():
@@ -296,5 +391,5 @@ def find_recipe_by_name(name):
     return None
 
 if __name__ == '__main__':
+    print("Кулинарный бот запущен!")
     bot.polling(none_stop=True)
-   
